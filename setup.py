@@ -21,7 +21,7 @@ setuptools.setup(
     python_requires='>=3.6',
     install_requires=[
         'websockets',
-        'bluepy',
+        'bleak',
         'pyOpenSSL',
         ],
     entry_points={

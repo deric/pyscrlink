@@ -17,12 +17,15 @@ import signal
 import traceback
 import argparse
 
-# for BLESession (e.g. BBC micro:bit)
-from bluepy.btle import Scanner, UUID, Peripheral, DefaultDelegate, ScanEntry
-from bluepy.btle import BTLEDisconnectError, BTLEManagementError
+from bleak import BleakScanner
+from bleak import BleakClient
+from bleak.exc import BleakError
+from bleak.backends.device import BLEDevice
+from bleak.backends.scanner import AdvertisementData
 from pyscrlink import bluepy_helper_cap
 
 import threading
+import traceback
 import time
 import queue
 
@@ -67,7 +70,7 @@ class Session():
         if jsonreq['jsonrpc'] != '2.0':
             logger.error("error: jsonrpc version is not 2.0")
             return True
-        jsonres = self.handle_request(jsonreq['method'], jsonreq['params'])
+        jsonres = await self.handle_request(jsonreq['method'], jsonreq['params'])
         if 'id' in jsonreq:
             jsonres['id'] = jsonreq['id']
         response = json.dumps(jsonres)
@@ -77,7 +80,7 @@ class Session():
             return True
         return False
 
-    def handle_request(self, method, params):
+    async def handle_request(self, method, params):
         """Default request handler"""
         logger.debug(f"default handle_request: {method}, {params}")
 
@@ -156,7 +159,7 @@ class BLESession(Session):
 
     MAX_SCANNER_IF = 3
 
-    found_devices = []
+    found_devices = {}
     nr_connected = 0
     scan_lock = threading.RLock()
     scan_started = False
@@ -173,14 +176,13 @@ class BLESession(Session):
 
         def run(self):
             while True:
-                logger.debug("loop in BLE thread")
                 if self.session.status == self.session.DISCOVERY:
                     logger.debug("send out found devices")
                     devices = BLESession.found_devices
-                    for d in devices:
-                        params = { 'rssi': d.rssi }
-                        params['peripheralId'] = devices.index(d)
-                        params['name'] = d.getValueText(0x9) or d.getValueText(0x8)
+                    for dev, advert in devices.values():
+                        params = { 'rssi': advert.rssi }
+                        params['peripheralId'] = dev.address
+                        params['name'] = dev.name
                         self.session.notify('didDiscoverPeripheral', params)
                     time.sleep(1)
                 elif self.session.status == self.session.CONNECTED:
@@ -209,13 +211,12 @@ class BLESession(Session):
                     # Nothing to do:
                     time.sleep(0)
 
-    class BLEDelegate(DefaultDelegate):
+    class BLEDelegate():
         """
-        A bluepy handler to receive notifictions from BLE devices.
+        A bleak handler to receive notifictions from BLE devices.
         """
-        def __init__(self, session):
-            DefaultDelegate.__init__(self)
-            self.session = session
+        def __init__(self, client):
+            self.client = client
             self.handles = {}
             self.restart_notification_event = threading.Event()
             self.restart_notification_event.set()
@@ -227,11 +228,11 @@ class BLESession(Session):
                        'encoding': 'base64' }
             self.handles[handle] = params
 
-        def handleNotification(self, handle, data):
+        async def handleNotification(self, handle, data):
             logger.debug(f"BLE notification: {handle} {data}")
             params = self.handles[handle].copy()
             params['message'] = base64.standard_b64encode(data).decode('ascii')
-            self.session.notify('characteristicDidChange', params)
+            await self.client.start_notify('characteristicDidChange', params)
 
     def __init__(self, websocket, loop):
         super().__init__(websocket, loop)
@@ -271,11 +272,11 @@ class BLESession(Session):
                 return service_class_uuids
         return None
 
-    def matches(self, dev, filters):
+    def matches(self, dev, advert, filters):
         """
         Check if the found BLE device matches the filters Scratch specifies.
         """
-        logger.debug(f"in matches {dev.addr} {filters}")
+        logger.info(f"in matches {dev.name} {filters}")
         for f in filters:
             if 'services' in f:
                 for s in f['services']:
@@ -293,13 +294,13 @@ class BLESession(Session):
                             return True
             if 'namePrefix' in f:
                 logger.debug(f"given namePrefix: {f['namePrefix']}")
-                deviceName = dev.getValueText(ScanEntry.SHORT_LOCAL_NAME)
+                deviceName = dev.name
                 if deviceName:
                     logger.debug(f"SHORT_LOCAL_NAME: {deviceName}")
                     if deviceName.startswith(f['namePrefix']):
                         logger.debug(f"match...")
                         return True
-                deviceName = dev.getValueText(ScanEntry.COMPLETE_LOCAL_NAME)
+                deviceName = advert.local_name
                 if deviceName:
                     logger.debug(f"COMPLETE_LOCAL_NAME: {deviceName}")
                     if deviceName.startswith(f['namePrefix']):
@@ -311,7 +312,7 @@ class BLESession(Session):
                 # ref: https://github.com/LLK/scratch-link/blob/develop/Documentation/BluetoothLE.md
         return False
 
-    def _scan_devices(self, params):
+    async def _scan_devices(self, params):
         global scan_seconds
         if BLESession.nr_connected > 0:
             return len(BLESession.found_devices) > 0
@@ -320,25 +321,22 @@ class BLESession(Session):
             if not BLESession.scan_started:
                 BLESession.scan_started = True
                 BLESession.found_devices.clear()
-                for i in range(self.MAX_SCANNER_IF):
-                    scanner = Scanner(iface=i)
-                    for j in range(scan_retry):
-                        try:
-                            logger.debug(f"start BLE scan: {scan_seconds} seconds")
-                            devices = scanner.scan(scan_seconds)
-                            for dev in devices:
-                                if self.matches(dev, params['filters']):
-                                    BLESession.found_devices.append(dev)
-                                    found = True
-                                    logger.debug(f"BLE device found with iface #{i}");
-                            if found:
-                                break
-                        except BTLEDisconnectError as de:
-                            logger.debug(f"BLE iface #{i}: {de}");
-                        except BTLEManagementError as me:
-                            logger.debug(f"BLE iface #{i}: {me}");
-                    if found:
-                        break
+                for j in range(scan_retry):
+                    try:
+                        logger.info(f"BLE scanning for: {scan_seconds} seconds (attempt {j})")
+                        devices: Dict[str, Tuple[BLEDevice, AdvertisementData]] = await BleakScanner.discover(scan_seconds, return_adv=True)
+                        for dev, advert in devices.values():
+                            logger.info(f"device: {dev}")
+                            logger.debug(advert)
+                            if self.matches(dev, advert, params['filters']):
+                                logger.info(f"match: {dev.name}")
+                                BLESession.found_devices[dev.address] = [dev, advert]
+                                found = True
+                                logger.info(f"BLE device found with iface #{i}");
+                        if found:
+                            break
+                    except Exception as e:
+                        logger.debug(f"BLE iface #{dev}: {e}");
             else:
                 found = len(BLESession.found_devices) > 0
         return found
@@ -355,10 +353,10 @@ class BLESession(Session):
             return charas[0]
 
     def _cache_characteristics(self):
-        if not self.perip:
+        if not self.client:
             return
         with self.lock:
-            self.characteristics_cache = self.perip.getCharacteristics()
+            self.characteristics_cache = self.client.characteristics
         if not self.characteristics_cache:
             logger.debug("Characteristics are not cached")
 
@@ -373,7 +371,7 @@ class BLESession(Session):
                     return characteristic
         return _get_characteristic(chara_id)
 
-    def handle_request(self, method, params):
+    async def handle_request(self, method, params):
         """Handle requests from Scratch"""
         if self.delegate:
             # Do not allow notification during request handling to avoid
@@ -395,7 +393,7 @@ class BLESession(Session):
                 logger.error("e.g. $ bluepy_helper_cap")
                 logger.error("e.g. $ sudo bluepy_helper_cap.py")
                 sys.exit(1)
-            found = self._scan_devices(params)
+            found = await self._scan_devices(params)
             if not found:
                 if BLESession.nr_connected > 0:
                     err_msg = "Can not scan BLE devices. Disconnect other sessions."
@@ -418,15 +416,36 @@ class BLESession(Session):
                 self.ble_thread.start()
 
         elif self.status == self.DISCOVERY and method == 'connect':
-            logger.debug("connecting to the BLE device")
-            self.device = BLESession.found_devices[params['peripheralId']]
-            self.deviceName = self.device.getValueText(0x9) or self.device.getValueText(0x8)
+            logger.info("connecting to the BLE device")
+            self.device, advert = BLESession.found_devices[params['peripheralId']]
+            self.deviceName = self.device.name
+
+            self.client = BleakClient(self.device.address)
             try:
-                self.perip = Peripheral(self.device)
-                logger.info(f"connected to the BLE peripheral: {self.deviceName}")
-                BLESession.found_devices.remove(self.device)
-            except BTLEDisconnectError as e:
-                logger.error(f"failed to connect to the BLE device \"{self.deviceName}\": {e}")
+                connected = await self.client.connect()
+                if connected:
+                    self.status = self.CONNECTED
+                    BLESession.nr_connected += 1
+                    logger.info(f"connected to the BLE peripheral: {self.deviceName}")
+                    self.delegate = self.BLEDelegate(self.client)
+                    self._cache_characteristics
+
+                    def callback(_, data: bytearray):
+                        content = ":".join(["{:02x}".format(x) for x in data])
+                        log.info(f"{time.time():.3f} Received {content}")
+                        if self.__response_callback:
+                            self.__response_callback(data)
+
+            except BleakError as e:
+                err_msg = f"BLE connect failed: {self.deviceName}"
+                res["error"] = { "message": err_msg }
+                self.status = self.DONE
+                logger.error(e)
+            except Exception as e:
+                print(e)
+            finally:
+                await self.client.disconnect()
+                BLESession.found_devices.pop(self.device.address)
                 self.status = self.DONE
 
             if self.perip:
@@ -527,6 +546,7 @@ async def ws_handler(websocket, path):
     except Exception as e:
         logger.error(f"Failure in session for web socket path: {path}")
         logger.error(f"{type(e).__name__}: {e}")
+        print(traceback.format_exc())
         session.close()
 
 def stack_trace():
@@ -549,7 +569,7 @@ def main():
     parser = argparse.ArgumentParser(description='start Scratch-link')
     parser.add_argument('-d', '--debug', action='store_true',
                         help='print debug messages')
-    parser.add_argument('-s', '--scan_seconds', type=float, default=10.0,
+    parser.add_argument('-s', '--scan_seconds', type=float, default=5.0,
                         help='specifiy duration to scan BLE devices in seconds')
     parser.add_argument('-r', '--scan_retry', type=int, default=1,
                         help='specifiy retry times to scan BLE devices')
