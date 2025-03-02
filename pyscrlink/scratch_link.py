@@ -23,6 +23,7 @@ from bleak.exc import BleakError
 from bleak.backends.device import BLEDevice
 from bleak.backends.scanner import AdvertisementData
 from pyscrlink import bluepy_helper_cap
+from websockets.exceptions import ConnectionClosedOK
 
 import threading
 import traceback
@@ -123,6 +124,10 @@ class Session():
                     break
                 await self._send_notifications()
                 logger.debug("in handle loop")
+            except ConnectionClosedOK as e:
+                logger.warning(f"scratch closed session: {e}")
+                self.close()
+                break
             except websockets.ConnectionClosedError as e:
                 logger.info("scratch closed session")
                 logger.error(e)
