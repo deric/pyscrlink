@@ -65,7 +65,7 @@ class Session():
             req = await asyncio.wait_for(self.websocket.recv(), 0.0001)
         except asyncio.TimeoutError:
             return False
-        logger.info(f"request: {req}")
+        logger.debug(f"request: {req}")
         jsonreq = json.loads(req)
         if jsonreq['jsonrpc'] != '2.0':
             logger.error("error: jsonrpc version is not 2.0")
@@ -74,7 +74,7 @@ class Session():
         if 'id' in jsonreq:
             jsonres['id'] = jsonreq['id']
         response = json.dumps(jsonres)
-        logger.info(f"response: {response}")
+        logger.debug(f"response: {response}")
         await self.websocket.send(response)
         if self.end_request():
             return True
@@ -203,20 +203,21 @@ class BLESession(Session):
                             self.session.close()
                             break
                     else:
-                        time.sleep(0.0)
+                        time.sleep(0.2)
                     # To avoid repeated lock by this single thread,
                     # yield CPU to other lock waiting threads.
-                    time.sleep(0)
+                    time.sleep(0.4)
                 else:
                     # Nothing to do:
-                    time.sleep(0)
+                    time.sleep(0.5)
 
     class BLEDelegate():
         """
         A bleak handler to receive notifictions from BLE devices.
         """
-        def __init__(self, client):
+        def __init__(self, client, session):
             self.client = client
+            self.session = session
             self.handles = {}
             self.restart_notification_event = threading.Event()
             self.restart_notification_event.set()
@@ -229,17 +230,20 @@ class BLESession(Session):
             self.handles[handle] = params
 
         async def handleNotification(self, handle, data):
-            logger.info(f"BLE notification: {handle} {data}")
-            params = self.handles[handle].copy()
+            logger.debug(f"BLE notification: {handle}")
+            params = {}
+            params['characteristicId'] = handle.uuid
+            params['serviceId'] = handle.service_uuid
             params['message'] = base64.standard_b64encode(data).decode('ascii')
-            await self.client.start_notify('characteristicDidChange', params)
+            self.session.notify('characteristicDidChange', params)
+            await asyncio.sleep(0.5)
 
     def __init__(self, websocket, loop):
         super().__init__(websocket, loop)
         self.status = self.INITIAL
         self.device = None
         self.deviceName = None
-        self.perip = None
+        self.client = None
         self.delegate = None
         self.characteristics_cache = []
 
@@ -329,7 +333,7 @@ class BLESession(Session):
                             logger.debug(f"device: {dev}")
                             logger.debug(advert)
                             if self.matches(dev, advert, params['filters']):
-                                logger.info(f"match: {dev.name}")
+                                logger.debug(f"match: {dev.name}")
                                 BLESession.found_devices[dev.address] = [dev, advert]
                                 found = True
                                 logger.info(f"BLE device found: #{dev}")
@@ -380,6 +384,12 @@ class BLESession(Session):
                         ",".join(char.properties),
                         extra,
                     )
+                    for descriptor in char.descriptors:
+                        try:
+                            value = await self.client.read_gatt_descriptor(descriptor.handle)
+                            logger.info("    [Descriptor] %s, Value: %r", descriptor, value)
+                        except Exception as e:
+                            logger.error("    [Descriptor] %s, Error: %s", descriptor, e)
                     self.characteristics_cache[char] = char.properties
 
         if not self.characteristics_cache:
@@ -402,8 +412,7 @@ class BLESession(Session):
             # websocket server errors
             self.delegate.restart_notification_event.clear()
 
-        logger.debug("handle request to BLE device")
-        logger.debug(method)
+        logger.debug(f"handle {method} request to BLE device")
         if len(params) > 0:
             logger.debug(params)
 
@@ -451,9 +460,9 @@ class BLESession(Session):
                     self.status = self.CONNECTED
                     BLESession.nr_connected += 1
                     logger.info(f"connected to the BLE peripheral: {self.deviceName}")
-                    self.delegate = self.BLEDelegate(self.client)
+                    self.delegate = self.BLEDelegate(self.client, self)
                     await self._cache_characteristics()
-                    logger.info(f"connect done.")
+                    logger.debug(f"connect done.")
 
             except BleakError as e:
                 err_msg = f"BLE connect failed: {self.deviceName}"
@@ -469,7 +478,7 @@ class BLESession(Session):
             service_id = params['serviceId']
             chara_id = params['characteristicId']
             c = self._get_characteristic_cached(chara_id)
-            if not c or c.uuid != UUID(chara_id):
+            if not c or c.uuid != chara_id:
                 logger.error(f"Failed to get characteristic {chara_id}")
                 self.status = self.DONE
             else:
@@ -477,7 +486,9 @@ class BLESession(Session):
                     b = c.read()
                 message = base64.standard_b64encode(b).decode('ascii')
                 res['result'] = { 'message': message, 'encode': 'base64' }
+                logger.debug(f"got msg: {message}")
             if params.get('startNotifications') == True:
+                logger.debug(f"starting notifications for svc {service_id}")
                 self.startNotifications(service_id, chara_id)
 
         elif self.status == self.CONNECTED and method == 'startNotifications':
@@ -505,7 +516,6 @@ class BLESession(Session):
                     logger.error("encoding other than base 64 is not "
                                  "yet supported: ", params['encoding'])
                 msg_bstr = params['message'].encode('ascii')
-                logger.info(f"msg: {params['message']}, {msg_bstr}")
                 data = base64.standard_b64decode(msg_bstr)
                 logger.debug("getting lock for c.write()")
                 with self.lock:
@@ -519,16 +529,20 @@ class BLESession(Session):
     async def setNotifications(self, service_id, chara_id, value):
         service = self._get_service(service_id)
         c = self._get_characteristic_cached(chara_id)
-        logger.info(f"chara: {c}" )
-        # prepare notification handler
-        self.delegate.add_handle(service_id, chara_id, c.handle)
-        # request notification to the BLE device
-        with self.lock:
-            await self.client.write_gatt_char(c.handle, value, response=True)
+        if c is not None:
+            # prepare notification handler
+            self.delegate.add_handle(service_id, chara_id, c.handle)
+            # request notification to the BLE device
+            with self.lock:
+                await self.client.write_gatt_char(c.handle, value, response=True)
+                # start keep-alive thread. TODO: for intelino only?
+                logger.info(f"starting notifications for {chara_id}")
+                await self.client.start_notify(chara_id, self.delegate.handleNotification)
+
 
     async def startNotifications(self, service_id, chara_id):
-        logger.debug(f"start notification for {chara_id}")
         value = bytearray([0x10]) # b"\x01\x00"
+        logger.debug(f"start notification for {chara_id}: {value}")
         await self.setNotifications(service_id, chara_id, value)
 
     async def stopNotifications(self, service_id, chara_id):
